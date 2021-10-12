@@ -2,11 +2,13 @@ package cmd
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
 	"os"
+	"path"
 	"path/filepath"
 
 	"github.com/exercism/cli/api"
@@ -26,7 +28,6 @@ var submitCmd = &cobra.Command{
 
     Call the command with the list of files you want to submit.
 `,
-	Args: cobra.MinimumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cfg := config.NewConfig()
 
@@ -56,56 +57,102 @@ func runSubmit(cfg config.Config, flags *pflag.FlagSet, args []string) error {
 
 	ctx := newSubmitCmdContext(cfg.UserViperConfig, flags)
 
-	if err := ctx.validator.filesExistAndNotADir(args); err != nil {
-		return err
+	var submitPaths []string
+	var err error
+	var exercise workspace.Exercise
+
+	if len(args) > 0 {
+		if err := ctx.validator.filesExistAndNotADir(args); err != nil {
+			return err
+		}
+
+		submitPaths, err = ctx.evaluatedSymlinks(args)
+		if err != nil {
+			return err
+		}
+
+		submitPaths = ctx.removeDuplicatePaths(submitPaths)
+
+		if err = ctx.validator.filesBelongToSameExercise(submitPaths); err != nil {
+			return err
+		}
+
+		exercise, err = ctx.exercise(submitPaths[0])
+		if err != nil {
+			return err
+		}
+
+		if err = ctx.migrateLegacyMetadata(exercise); err != nil {
+			return err
+		}
+
+	} else {
+		fmt.Println("Called submit without any arguments")
+
+		fmt.Println("Calling os.Getwd()")
+		cwd, err := os.Getwd()
+		if err != nil {
+			return err
+		}
+		fmt.Println("Current working directory is: ", cwd)
+
+		fmt.Println("Calling ctx.exercise(cwd)")
+		exercise, err = ctx.exercise(cwd)
+		if err != nil {
+			return err
+		}
+		fmt.Println("Successfully created exercise from current working directory")
+
+		fmt.Println("Calling migrateLegacyMetadata")
+		if err = ctx.migrateLegacyMetadata(exercise); err != nil {
+			return err
+		}
+
+		fmt.Println("Calling getSubmitPaths")
+		submitPaths, err = ctx.getSubmitPaths(exercise)
+		if err != nil {
+			return err
+		}
 	}
 
-	submitPaths, err := ctx.evaluatedSymlinks(args)
-	if err != nil {
-		return err
+	fmt.Println("Printing submitPaths")
+	for _, s2 := range submitPaths {
+		fmt.Println("\tsubmitPath: ", s2)
 	}
 
-	submitPaths = ctx.removeDuplicatePaths(submitPaths)
-
-	if err = ctx.validator.filesBelongToSameExercise(submitPaths); err != nil {
-		return err
-	}
-
-	exercise, err := ctx.exercise(submitPaths[0])
-	if err != nil {
-		return err
-	}
-
-	if err = ctx.migrateLegacyMetadata(exercise); err != nil {
-		return err
-	}
-
+	fmt.Println("Calling filesSizesWithinMax")
 	if err = ctx.validator.fileSizesWithinMax(submitPaths); err != nil {
 		return err
 	}
 
+	fmt.Println("Calling ctx.documents")
 	documents, err := ctx.documents(submitPaths, exercise)
 	if err != nil {
 		return err
 	}
 
+	fmt.Println("Calling ctx.validator.submissionNotEmpty")
 	if err = ctx.validator.submissionNotEmpty(documents); err != nil {
 		return err
 	}
 
+	fmt.Println("Calling metadata")
 	metadata, err := ctx.metadata(exercise)
 	if err != nil {
 		return err
 	}
 
+	fmt.Println("Calling metadataMatchesExercise")
 	if err := ctx.validator.metadataMatchesExercise(metadata, exercise); err != nil {
 		return err
 	}
 
+	fmt.Println("Calling ctx.validator.isRequestor")
 	if err := ctx.validator.isRequestor(metadata); err != nil {
 		return err
 	}
 
+	fmt.Println("Calling ctx.submit")
 	if err := ctx.submit(metadata, documents); err != nil {
 		return err
 	}
@@ -174,6 +221,34 @@ func (s *submitCmdContext) exercise(aSubmitPath string) (workspace.Exercise, err
 		return workspace.Exercise{}, err
 	}
 	return workspace.NewExerciseFromDir(dir), nil
+}
+
+func (s *submitCmdContext) getSubmitPaths(exercise workspace.Exercise) ([]string, error) {
+	f, err := os.ReadFile(path.Join(exercise.MetadataDir(),".exercism", "config.json"))
+
+	if err != nil {
+		return nil, err
+	}
+
+	var configFile ConfigFile
+
+	if err := json.Unmarshal(f, &configFile); err != nil {
+		return nil, err
+	}
+
+	var submitPaths []string
+
+	for _, s2 := range configFile.Files.Solution {
+		submitPaths = append(submitPaths, path.Join(exercise.Path(),s2))
+	}
+
+	return submitPaths, nil
+}
+
+type ConfigFile struct {
+	Files struct {
+		Solution []string `json:"solution"`
+	} `json:"files"`
 }
 
 func (s *submitCmdContext) migrateLegacyMetadata(exercise workspace.Exercise) error {
